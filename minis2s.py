@@ -1,3 +1,5 @@
+import os
+
 import tensorflow as tf
 from tensorflow.python.ops import lookup_ops
 
@@ -87,9 +89,9 @@ def get_input(hparams):
             
     return dataset
 
-def get_model(src, tgt_in, tgt_out, src_len, tgt_len, hparams):
+def get_model(src, tgt_in, tgt_out, src_len, tgt_len, mode, hparams):
     encoder_state = build_encoder(src, src_len)
-    return build_decoder(encoder_state, tgt_in, tgt_out, tgt_len, hparams)
+    return build_decoder(encoder_state, tgt_in, tgt_out, tgt_len, mode, hparams)
 
 def build_encoder(src, src_len):
     src = tf.transpose(src)
@@ -108,7 +110,7 @@ def build_encoder(src, src_len):
         swap_memory=True)
     return encoder_state
 
-def build_decoder(decoder_initial_state, tgt_in, tgt_out, tgt_len, hparams):
+def build_decoder(decoder_initial_state, tgt_in, tgt_out, tgt_len, mode, hparams):
     tgt_in = tf.transpose(tgt_in)
     tgt_out = tf.transpose(tgt_out)
 
@@ -138,18 +140,21 @@ def build_decoder(decoder_initial_state, tgt_in, tgt_out, tgt_len, hparams):
 
     logits = tf.layers.dense(outputs.rnn_output, hparams.tgt_vocab_size)
 
-    crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
-        labels=tgt_out, logits=logits)
-    max_time = tf.shape(tgt_in)[0]
-    target_weights = tf.sequence_mask(
-        tgt_len, max_time, dtype=tf.float32)
+    if mode != tf.estimator.ModeKeys.PREDICT:
+        crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=tgt_out, logits=logits)
+        max_time = tf.shape(tgt_in)[0]
+        target_weights = tf.sequence_mask(
+            tgt_len, max_time, dtype=tf.float32)
 
-    target_weights = tf.transpose(target_weights)
+        target_weights = tf.transpose(target_weights)
 
-    loss = tf.reduce_sum(
-        crossent * target_weights) / tf.to_float(hparams.batch_size)
+        loss = tf.reduce_sum(
+            crossent * target_weights) / tf.to_float(hparams.batch_size)
 
-    return loss
+        return loss
+
+    return logits
 
 def dump_input(hparams):
     src_idx2sym = get_src_vocab()
@@ -173,22 +178,33 @@ def dump_input(hparams):
                 tgt_out_val2 = ' '.join(tgt_idx2sym[x] for x in tgt_out_val[j])
             print(src_val2, tgt_in_val2, tgt_out_val2)
 
+def model_fn(features, labels, mode, params):
+    loss = get_model(
+        features['source'],
+        features['target_input'],
+        features['target_output'],
+        features['source_length'],
+        features['target_length'],
+        mode,
+        hparams
+    )
+
+    if mode == tf.estimator.ModeKeys.PREDICT:
+        logits = loss
+        predicted_classes = tf.argmax(logits, axis=2)
+        predictions = {
+            'class_ids': predicted_classes[:, tf.newaxis],
+            'probabilities': tf.nn.softmax(logits),
+            'logits': logits,
+        }
+        return tf.estimator.EstimatorSpec(mode, predictions=predictions)
+
+    optimizer = tf.train.GradientDescentOptimizer(learning_rate=0.1)
+
+    train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
+    return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_op)
+
 def train(hparams):
-    def model_fn(features, labels, mode, params):
-        loss = get_model(
-            features['source'],
-            features['target_input'],
-            features['target_output'],
-            features['source_length'],
-            features['target_length'],
-            hparams
-        )
-
-        optimizer = tf.train.GradientDescentOptimizer(learning_rate=0.1)
-
-        train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
-        return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_op)
-
     def input_fn():
         dataset = get_input(hparams)
         iterator = dataset.make_initializable_iterator()
@@ -205,14 +221,36 @@ def train(hparams):
     estimator = tf.estimator.Estimator(model_fn=model_fn, params={})
     estimator.train(input_fn=lambda: input_fn())
 
+def infer(hparams):
+    def input_fn():
+        src_vocab_table, tgt_vocab_table = get_vocab_table(hparams)
+
+        return ({
+            'source': tf.cast(src_vocab_table.lookup(tf.convert_to_tensor(["S A M P L E".split()], tf.string)), tf.int32),
+            'target_input': tf.cast(tgt_vocab_table.lookup(tf.convert_to_tensor(["S IH1".split()], tf.string)), tf.int32),
+            'target_output': tf.cast(tgt_vocab_table.lookup(tf.convert_to_tensor(["IH1 M".split()], tf.string)), tf.int32),
+            'source_length': [6],
+            'target_length': [2]
+        }, {})
+
+    estimator = tf.estimator.Estimator(model_fn=model_fn, params={}, model_dir=hparams.model_dir)
+    pred = estimator.predict(input_fn=lambda: input_fn())
+
+    for p in pred:
+        print(p)
+        break
+
+
 hparams = tf.contrib.training.HParams(
     batch_size=64,
     src_vocab_size=128,
     tgt_vocab_size=128,
     num_units=128,
-    input_file='cmudict-0.7b',
-    tgt_vocab_file='cmudict-0.7b.symbols'
+    input_file=os.path.join('data', 'cmudict-0.7b'),
+    tgt_vocab_file=os.path.join('data', 'cmudict-0.7b.symbols'),
+    model_dir=os.path.join('train', 'minis2s')
 )
 
 #dump_input(hparams)
-train(hparams)
+#train(hparams)
+infer(hparams)
