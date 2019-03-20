@@ -1,18 +1,98 @@
+"""Minimum sequence-to-sequence model to demonstrate how to use TensorFlow API.
+
+Visit https://github.com/kiidax/minis2s for the original copy.
+
+This implements basic sequence-to-sequence model with LSTM encoder and decoder to
+translate an English word into phone symbols using CMU pronuncing dictionary
+(http://www.speech.cs.cmu.edu/cgi-bin/cmudict). The model is very small and will run on
+a notebook with 4GB memory.
+"""
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
 import os
+import random
 
 import tensorflow as tf
 from tensorflow.python.ops import lookup_ops
 
+# Flag definitions
+
 flags = tf.flags
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("data_dir", "", "Data directory.")
-flags.DEFINE_string("output_dir", "", "Base output directory for run.")
-flags.DEFINE_string("mode", "", "run mode.")
+flags.DEFINE_enum("mode", None, ["datagen", "train", "eval", "infer"], "Run mode.")
+flags.DEFINE_string("data_dir", None, "Data directory.")
+flags.DEFINE_string("output_dir", None, "Base output directory for run.")
+flags.mark_flags_as_required(['mode', 'data_dir'])
+
+# Data preparation
+
+def datagen(hparams):
+    """Split original cmudict files into train, dev and test set,
+    and prepare vocab files.
+    """
+    cmudict_file = os.path.join(FLAGS.data_dir, 'cmudict-0.7b')
+    cmuvocab_file = os.path.join(FLAGS.data_dir, 'cmudict-0.7b.symbols')
+
+    for source_file in (cmudict_file, cmuvocab_file):
+        if not os.path.exists(source_file):
+            print('%s not found.' % source_file)
+            print('Please visit http://www.speech.cs.cmu.edu/cgi-bin/cmudict and download.')
+            return
+    
+    print("Reading %s..." % cmudict_file)
+    with open(cmudict_file, 'r') as f:
+        lines = [line.strip() for line in f]
+    samples = [line.split() for line in lines if len(line) > 0 and not line.startswith(';')]
+    samples = [(list(s[0]), s[1:]) for s in samples]
+    samples = [(' '.join(src), ' '.join(tgt)) for src, tgt in samples]
+
+    random.shuffle(samples)
+    num_samples = len(lines)
+    num_dev_samples = num_samples // 10
+    num_test_samples = num_samples // 10
+    num_train_samples = num_samples - num_dev_samples - num_test_samples
+
+    write_samples(samples[:num_train_samples], "train")
+    write_samples(samples[num_train_samples:-num_test_samples], "dev")
+    write_samples(samples[-num_test_samples:], "test")
+
+    print("Reading %s..." % cmuvocab_file)
+    with open(cmuvocab_file, 'r') as f:
+        vocab = [line.strip() for line in f]
+    vocab = ['<unk>', '<s>', '</s>'] + vocab
+
+    output_file = os.path.join(FLAGS.data_dir, 'vocab.tgt')
+    print("Writing %s" % output_file)
+    with open(output_file, 'w') as f:
+        f.writelines([sym + '\n' for sym in vocab])
+
+    vocab = list(set(tok for src, _ in samples for tok in src.split(' ')))
+    vocab = sorted(vocab)
+    vocab = ['<unk>', '<s>', '</s>'] + vocab
+
+    output_file = os.path.join(FLAGS.data_dir, 'vocab.src')
+    print("Writing %s" % output_file)
+    with open(output_file, 'w') as f:
+        f.writelines([sym + '\n' for sym in vocab])
+
+    print('Done')
+
+def write_samples(samples, output_prefix):
+    output_file = os.path.join(FLAGS.data_dir, '%s.src' % output_prefix)
+    print("Writing %s..." % output_file)
+    with open(output_file, 'w') as f:
+        f.writelines([src + '\n' for src, _ in samples])
+    output_file = os.path.join(FLAGS.data_dir, '%s.tgt' % output_prefix)
+    print("Writing %s..." % output_file)
+    with open(output_file, 'w') as f:
+        f.writelines([tgt + '\n' for _, tgt in samples])
+
+
+# Vocabulary
 
 def get_src_vocab():
     idx2sym = (
@@ -129,39 +209,46 @@ def build_encoder(src, src_len, hparams):
     return encoder_state
 
 def build_decoder(decoder_initial_state, tgt_in, tgt_out, tgt_len, mode, hparams):
-    tgt_in = tf.transpose(tgt_in)
-    tgt_out = tf.transpose(tgt_out)
+    tgt_sos_id = 1
+    tgt_eos_id = 2
 
     embedding_decoder = tf.get_variable('embedding_decoder', (hparams.tgt_vocab_size, hparams.num_units), tf.float32)
-    decoder_emb_inp = tf.nn.embedding_lookup(
-        embedding_decoder, tgt_in)
-    decoder_emb_inp = tf.Print(decoder_emb_inp, [tf.shape(decoder_emb_inp)])
 
     cell = tf.nn.rnn_cell.LSTMCell(hparams.num_units, forget_bias=1.0)
 
-    # Helper
-    helper = tf.contrib.seq2seq.TrainingHelper(
-        decoder_emb_inp, tgt_len,
-        time_major=True)
+    output_layer = tf.layers.Dense(hparams.tgt_vocab_size)
+    output_layer(tf.placeholder(tf.float32, [None, hparams.num_units]))
 
-    # Decoder
-    my_decoder = tf.contrib.seq2seq.BasicDecoder(
-        cell,
-        helper,
-        decoder_initial_state)
+    if mode != tf.estimator.ModeKeys.PREDICT:
+        tgt_in = tf.transpose(tgt_in)
+        tgt_out = tf.transpose(tgt_out)
 
-    # Dynamic decoding
-    outputs, final_context_state, _ = tf.contrib.seq2seq.dynamic_decode(
-        my_decoder,
-        output_time_major=True,
-        swap_memory=True,
-        scope='decoder')
+        decoder_emb_inp = tf.nn.embedding_lookup(
+            embedding_decoder, tgt_in)
+        decoder_emb_inp = tf.Print(decoder_emb_inp, [tf.shape(decoder_emb_inp)])
 
-    logits = tf.layers.dense(outputs.rnn_output, hparams.tgt_vocab_size)
-    print('logits', logits.shape)
-    logits = tf.Print(logits, [tf.shape(logits)])
+        # Helper
+        helper = tf.contrib.seq2seq.TrainingHelper(
+            decoder_emb_inp, tgt_len,
+            time_major=True)
 
-    if mode == tf.estimator.ModeKeys.TRAIN:
+        # Decoder
+        my_decoder = tf.contrib.seq2seq.BasicDecoder(
+            cell,
+            helper,
+            decoder_initial_state)
+
+        # Dynamic decoding
+        outputs, final_context_state, _ = tf.contrib.seq2seq.dynamic_decode(
+            my_decoder,
+            output_time_major=True,
+            swap_memory=True,
+            scope='decoder')
+
+        logits = output_layer(outputs.rnn_output)
+        print('logits', logits.shape)
+        logits = tf.Print(logits, [tf.shape(logits)])
+
         crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
             labels=tgt_out, logits=logits)
         max_time = tf.shape(tgt_in)[0]
@@ -176,60 +263,54 @@ def build_decoder(decoder_initial_state, tgt_in, tgt_out, tgt_len, mode, hparams
 
         return loss
 
-    assert mode == tf.estimator.ModeKeys.PREDICT
+    else: # tf.estimator.ModeKeys.PREDICT
+        decoder_initial_state = tf.contrib.seq2seq.tile_batch(
+            decoder_initial_state, multiplier=hparams.beam_width)
 
-    return logits
+        start_tokens = tf.fill([hparams.batch_size], tgt_sos_id)
+        end_token = tgt_eos_id
+        beam_width = hparams.beam_width
 
-def dump_input(hparams):
-    src_idx2sym = get_src_vocab()
-    tgt_idx2sym = get_tgt_vocab(hparams.tgt_vocab_file)
-    graph = tf.Graph()
-    with tf.Session(graph=graph) as sess:
-        dataset = get_input(hparams)
+        my_decoder = tf.contrib.seq2seq.BeamSearchDecoder(
+            cell=cell,
+            embedding=embedding_decoder,
+            start_tokens=start_tokens,
+            end_token=end_token,
+            initial_state=decoder_initial_state,
+            beam_width=beam_width,
+            output_layer=output_layer)
 
-        iterator = dataset.make_initializable_iterator()
-        initializer = tf.random_uniform_initializer(-1, 1)
-        tf.get_variable_scope().set_initializer(initializer)
-        sess.run(tf.tables_initializer())
-        sess.run(tf.global_variables_initializer())
-        sess.run(iterator.initializer)
-        src, tgt_in, tgt_out, src_len, tgt_len = iterator.get_next()
-        for i in range(100):
-            src_val, tgt_in_val, tgt_out_val = sess.run((src, tgt_in, tgt_out))
-            for j in range(src_val.shape[0]):
-                src_val2 = ''.join(src_idx2sym[x] for x in src_val[j])
-                tgt_in_val2 = ' '.join(tgt_idx2sym[x] for x in tgt_in_val[j])
-                tgt_out_val2 = ' '.join(tgt_idx2sym[x] for x in tgt_out_val[j])
-            print(src_val2, tgt_in_val2, tgt_out_val2)
+        # Dynamic decoding
+        outputs, final_context_state, _ = tf.contrib.seq2seq.dynamic_decode(
+            my_decoder,
+            maximum_iterations=hparams.max_tgt_len,
+            output_time_major=True,
+            swap_memory=True)
+
+        sample_id = outputs.predicted_ids
+
+    return sample_id
 
 def model_fn(features, labels, mode, params):
     hparams = params['hparams']
     src = features['source']
     src_len = features['source_length']
-    if labels is None:
-        src_vocab_table, tgt_vocab_table = get_vocab_table(hparams)
-        src = src_vocab_table.lookup(tf.convert_to_tensor(['S I M P L E'.split()], tf.string))
-        src_len = tf.convert_to_tensor([6], tf.int32)
-        tgt_in = tgt_vocab_table.lookup(tf.convert_to_tensor(['<s> S IH1 M P AH0 L'.split()], tf.string))
-        tgt_out = tgt_vocab_table.lookup(tf.convert_to_tensor(['S IH1 M P AH0 L </s>'.split()], tf.string))
-        tgt_len = tf.convert_to_tensor([7], tf.int32)
-    else:
+    if labels:
         tgt_in = labels['target_input']
         tgt_out = labels['target_output']
         tgt_len = labels['target_length']
+    else:
+        tgt_in, tgt_out, tgt_len = None, None, None
 
     encoder_state = build_encoder(src, src_len, hparams)
     loss = build_decoder(encoder_state, tgt_in, tgt_out, tgt_len, mode, hparams)
 
     if mode == tf.estimator.ModeKeys.PREDICT:
-        logits = loss
-        predicted_classes = tf.argmax(logits, axis=2)
-        predicted_classes = tf.transpose(predicted_classes)
-        logits = tf.transpose(logits)
+        sample_id = loss
+        sample_id = tf.transpose(sample_id)
+        print('sample_id', sample_id.shape)
         predictions = {
-            'class_ids': predicted_classes,
-            #'probabilities': tf.nn.softmax(logits),
-            #'logits': logits,
+            'sample_id': sample_id,
         }
         return tf.estimator.EstimatorSpec(mode, predictions=predictions)
 
@@ -246,30 +327,35 @@ def infer(hparams):
     predictions = estimator.predict(input_fn=lambda: get_input(hparams))
 
     for p in predictions:
-        class_ids = p['class_ids']
-        print(class_ids)
-        print(' '.join(tgt_idx2sym[y] for y in class_ids))
+        sample_id = p['sample_id']
+        print(sample_id)
+        for q in sample_id:
+            print(' '.join(tgt_idx2sym[y] for y in q))
         break
 
 def main(unused):
 
     hparams = tf.contrib.training.HParams(
-        batch_size=1,
+        batch_size=40,
         src_vocab_size=64,
         tgt_vocab_size=87,
         num_units=64,
+        beam_width=10,
+        max_tgt_len=20,
         input_file=os.path.join(FLAGS.data_dir, 'cmudict-0.7b'),
         tgt_vocab_file=os.path.join(FLAGS.data_dir, 'cmudict-0.7b.symbols'),
         output_dir=FLAGS.output_dir
     )
 
-    if FLAGS.mode == 'train':
+    if FLAGS.mode == 'datagen':
+        datagen(hparams)
+    elif FLAGS.mode == 'train':
         estimator = tf.estimator.Estimator(model_fn=model_fn, params={'hparams': hparams}, model_dir=hparams.output_dir)
         estimator.train(input_fn=lambda: get_input(hparams))
     elif FLAGS.mode == 'infer':
         infer(hparams)
     else:
-        dump_input(hparams)
+        raise ValueError("Unknown mode")
 
 if __name__ == "__main__":
     tf.app.run(main)
