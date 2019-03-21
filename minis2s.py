@@ -179,106 +179,152 @@ def get_input(is_train, hparams):
     'target_length': tgt_len
   })
 
-def build_encoder(src, src_len, src_vocab_size, hparams):
+def create_parameters():
+  hparams = tf.contrib.training.HParams(
+    batch_size=40,
+    sos='<s>',
+    eos='</s>',
+    embed_size=32,
+    num_units=64,
+    beam_width=10,
+    max_tgt_len=20,
+    src_train_file=os.path.join(FLAGS.data_dir, 'train.src'),
+    tgt_train_file=os.path.join(FLAGS.data_dir, 'train.tgt'),
+    src_dev_file=os.path.join(FLAGS.data_dir, 'dev.src'),
+    tgt_dev_file=os.path.join(FLAGS.data_dir, 'dev.tgt'),
+    src_test_file=os.path.join(FLAGS.data_dir, 'test.src'),
+    tgt_test_file=os.path.join(FLAGS.data_dir, 'test.tgt'),
+    src_vocab_file=os.path.join(FLAGS.data_dir, 'vocab.src'),
+    tgt_vocab_file=os.path.join(FLAGS.data_dir, 'vocab.tgt'),
+    output_dir=FLAGS.output_dir)
+  return hparams
+
+def create_embeddings(src_vocab_size,
+                      tgt_vocab_size,
+                      src_embed_size,
+                      tgt_embed_size):
+  with tf.variable_scope("embeddings"):
+    with tf.variable_scope("encoder"):
+      embedding_encoder = tf.get_variable(
+        'embedding_encoder',
+        (src_vocab_size, src_embed_size),
+        tf.float32)
+    with tf.variable_scope("decoder"):
+      embedding_decoder = tf.get_variable(
+        'embedding_decoder',
+        (tgt_vocab_size, tgt_embed_size),
+        tf.float32)
+  return embedding_encoder, embedding_decoder
+
+def build_encoder(src,
+                  src_len,
+                  embedding_encoder,
+                  hparams):
   src = tf.transpose(src)
 
-  embedding_encoder = tf.get_variable(
-    'embedding_encoder',
-    (src_vocab_size, hparams.num_units),
-    tf.float32)
-  encoder_emb_inp = tf.nn.embedding_lookup(
-    embedding_encoder, src)
+  with tf.variable_scope("encoder") as encoder_scope:
+    encoder_emb_inp = tf.nn.embedding_lookup(
+      embedding_encoder, src)
 
-  cell = tf.nn.rnn_cell.LSTMCell(hparams.num_units, forget_bias=1.0)
-  _, encoder_state = tf.nn.dynamic_rnn(
-    cell,
-    encoder_emb_inp,
-    dtype=tf.float32,
-    sequence_length=src_len,
-    time_major=True,
-    swap_memory=True)
+    cell = tf.nn.rnn_cell.LSTMCell(
+      hparams.num_units,
+      forget_bias=1.0)
+    _, encoder_state = tf.nn.dynamic_rnn(
+      cell,
+      encoder_emb_inp,
+      dtype=tf.float32,
+      sequence_length=src_len,
+      time_major=True,
+      swap_memory=True,
+      scope=encoder_scope)
+
   return encoder_state
 
-def build_decoder(decoder_initial_state, tgt_in, tgt_out, tgt_len, tgt_vocab_size, mode, hparams):
+def build_decoder(decoder_initial_state,
+                  tgt_in,
+                  tgt_out,
+                  tgt_len,
+                  embedding_decoder,
+                  tgt_vocab_size,
+                  mode,
+                  hparams):
   tgt_sos_id = 1
   tgt_eos_id = 2
 
-  embedding_decoder = tf.get_variable(
-    'embedding_decoder',
-    (tgt_vocab_size, hparams.num_units), tf.float32)
+  with tf.variable_scope("decoder") as decoder_scope:
+    cell = tf.nn.rnn_cell.LSTMCell(hparams.num_units, forget_bias=1.0)
 
-  cell = tf.nn.rnn_cell.LSTMCell(hparams.num_units, forget_bias=1.0)
+    output_layer = tf.layers.Dense(
+      tgt_vocab_size, use_bias=False, name="output_projection")
 
-  output_layer = tf.layers.Dense(tgt_vocab_size)
-  output_layer(tf.placeholder(tf.float32, [None, hparams.num_units]))
+    if mode != tf.estimator.ModeKeys.PREDICT:
+      tgt_in = tf.transpose(tgt_in)
+      tgt_out = tf.transpose(tgt_out)
 
-  if mode != tf.estimator.ModeKeys.PREDICT:
-    tgt_in = tf.transpose(tgt_in)
-    tgt_out = tf.transpose(tgt_out)
+      decoder_emb_inp = tf.nn.embedding_lookup(
+        embedding_decoder, tgt_in)
 
-    decoder_emb_inp = tf.nn.embedding_lookup(
-      embedding_decoder, tgt_in)
+      # Helper
+      helper = tf.contrib.seq2seq.TrainingHelper(
+        decoder_emb_inp, tgt_len,
+        time_major=True)
 
-    # Helper
-    helper = tf.contrib.seq2seq.TrainingHelper(
-      decoder_emb_inp, tgt_len,
-      time_major=True)
+      # Decoder
+      my_decoder = tf.contrib.seq2seq.BasicDecoder(
+        cell,
+        helper,
+        decoder_initial_state)
 
-    # Decoder
-    my_decoder = tf.contrib.seq2seq.BasicDecoder(
-      cell,
-      helper,
-      decoder_initial_state)
+      # Dynamic decoding
+      outputs, final_context_state, _ = tf.contrib.seq2seq.dynamic_decode(
+        my_decoder,
+        output_time_major=True,
+        swap_memory=True,
+        scope=decoder_scope)
 
-    # Dynamic decoding
-    outputs, final_context_state, _ = tf.contrib.seq2seq.dynamic_decode(
-      my_decoder,
-      output_time_major=True,
-      swap_memory=True,
-      scope='decoder')
+      logits = output_layer(outputs.rnn_output)
 
-    logits = output_layer(outputs.rnn_output)
+      crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
+        labels=tgt_out, logits=logits)
+      max_time = tf.shape(tgt_in)[0]
+      target_weights = tf.sequence_mask(
+        tgt_len, max_time, dtype=tf.float32)
 
-    crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
-      labels=tgt_out, logits=logits)
-    max_time = tf.shape(tgt_in)[0]
-    target_weights = tf.sequence_mask(
-      tgt_len, max_time, dtype=tf.float32)
+      target_weights = tf.transpose(target_weights)
 
-    target_weights = tf.transpose(target_weights)
+      loss = tf.reduce_sum(
+        crossent * target_weights) / tf.to_float(hparams.batch_size)
 
-    loss = tf.reduce_sum(
-      crossent * target_weights) / tf.to_float(hparams.batch_size)
+      return loss
 
-    return loss
+    else: # tf.estimator.ModeKeys.PREDICT
+      decoder_initial_state = tf.contrib.seq2seq.tile_batch(
+        decoder_initial_state, multiplier=hparams.beam_width)
 
-  else: # tf.estimator.ModeKeys.PREDICT
-    decoder_initial_state = tf.contrib.seq2seq.tile_batch(
-      decoder_initial_state, multiplier=hparams.beam_width)
+      start_tokens = tf.fill([hparams.batch_size], tgt_sos_id)
+      end_token = tgt_eos_id
+      beam_width = hparams.beam_width
 
-    start_tokens = tf.fill([hparams.batch_size], tgt_sos_id)
-    end_token = tgt_eos_id
-    beam_width = hparams.beam_width
+      my_decoder = tf.contrib.seq2seq.BeamSearchDecoder(
+        cell=cell,
+        embedding=embedding_decoder,
+        start_tokens=start_tokens,
+        end_token=end_token,
+        initial_state=decoder_initial_state,
+        beam_width=beam_width,
+        output_layer=output_layer)
 
-    my_decoder = tf.contrib.seq2seq.BeamSearchDecoder(
-      cell=cell,
-      embedding=embedding_decoder,
-      start_tokens=start_tokens,
-      end_token=end_token,
-      initial_state=decoder_initial_state,
-      beam_width=beam_width,
-      output_layer=output_layer)
+      # Dynamic decoding
+      outputs, final_context_state, _ = tf.contrib.seq2seq.dynamic_decode(
+        my_decoder,
+        maximum_iterations=hparams.max_tgt_len,
+        output_time_major=True,
+        swap_memory=True,
+        scope=decoder_scope)
 
-    # Dynamic decoding
-    outputs, final_context_state, _ = tf.contrib.seq2seq.dynamic_decode(
-      my_decoder,
-      maximum_iterations=hparams.max_tgt_len,
-      output_time_major=True,
-      swap_memory=True)
+      sample_id = outputs.predicted_ids
 
-    sample_id = outputs.predicted_ids
-
-  return sample_id
+    return sample_id
 
 def model_fn(features, labels, mode, params):
   hparams = params['hparams']
@@ -294,8 +340,17 @@ def model_fn(features, labels, mode, params):
   _, src_vocab_size = check_vocab(hparams.src_vocab_file)
   _, tgt_vocab_size = check_vocab(hparams.tgt_vocab_file)
 
-  encoder_state = build_encoder(src, src_len, src_vocab_size, hparams)
-  loss = build_decoder(encoder_state, tgt_in, tgt_out, tgt_len, tgt_vocab_size, mode, hparams)
+  embedding_encoder, embedding_decoder = create_embeddings(
+    src_vocab_size,
+    tgt_vocab_size,
+    hparams.embed_size,
+    hparams.embed_size)
+  with tf.variable_scope("dynamic_seq2seq"):
+    encoder_state = build_encoder(
+      src, src_len, embedding_encoder, hparams)
+    loss = build_decoder(
+      encoder_state, tgt_in, tgt_out, tgt_len, 
+      embedding_decoder, tgt_vocab_size, mode, hparams)
 
   if mode == tf.estimator.ModeKeys.PREDICT:
     sample_id = loss
@@ -329,24 +384,7 @@ def infer(hparams):
     break
 
 def main(unused):
-
-  hparams = tf.contrib.training.HParams(
-    batch_size=40,
-    sos='<s>',
-    eos='</s>',
-    num_units=64,
-    beam_width=10,
-    max_tgt_len=20,
-    src_train_file=os.path.join(FLAGS.data_dir, 'train.src'),
-    tgt_train_file=os.path.join(FLAGS.data_dir, 'train.tgt'),
-    src_dev_file=os.path.join(FLAGS.data_dir, 'dev.src'),
-    tgt_dev_file=os.path.join(FLAGS.data_dir, 'dev.tgt'),
-    src_test_file=os.path.join(FLAGS.data_dir, 'test.src'),
-    tgt_test_file=os.path.join(FLAGS.data_dir, 'test.tgt'),
-    src_vocab_file=os.path.join(FLAGS.data_dir, 'vocab.src'),
-    tgt_vocab_file=os.path.join(FLAGS.data_dir, 'vocab.tgt'),
-    output_dir=FLAGS.output_dir)
-
+  hparams = create_parameters()
   if FLAGS.mode == 'datagen':
     datagen(hparams)
   elif FLAGS.mode == 'train':
