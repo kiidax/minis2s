@@ -18,6 +18,8 @@ import random
 import tensorflow as tf
 from tensorflow.python.ops import lookup_ops
 
+tf.logging.set_verbosity(tf.logging.INFO)
+
 # Flag definitions
 
 flags = tf.flags
@@ -27,6 +29,30 @@ flags.DEFINE_enum("mode", None, ["datagen", "train", "eval", "infer"], "Run mode
 flags.DEFINE_string("data_dir", None, "Data directory.")
 flags.DEFINE_string("output_dir", None, "Base output directory for run.")
 flags.mark_flags_as_required(['mode', 'data_dir'])
+
+# Parameters
+
+def create_parameters():
+  hparams = tf.contrib.training.HParams(
+    batch_size=40,
+    num_epochs=4,
+    learning_rate=0.1,
+    sos='<s>',
+    eos='</s>',
+    embed_size=32,
+    num_units=64,
+    beam_width=10,
+    max_tgt_len=20,
+    src_train_file=os.path.join(FLAGS.data_dir, 'train.src'),
+    tgt_train_file=os.path.join(FLAGS.data_dir, 'train.tgt'),
+    src_dev_file=os.path.join(FLAGS.data_dir, 'dev.src'),
+    tgt_dev_file=os.path.join(FLAGS.data_dir, 'dev.tgt'),
+    src_test_file=os.path.join(FLAGS.data_dir, 'test.src'),
+    tgt_test_file=os.path.join(FLAGS.data_dir, 'test.tgt'),
+    src_vocab_file=os.path.join(FLAGS.data_dir, 'vocab.src'),
+    tgt_vocab_file=os.path.join(FLAGS.data_dir, 'vocab.tgt'),
+    output_dir=FLAGS.output_dir)
+  return hparams
 
 # Data preparation
 
@@ -127,8 +153,8 @@ def get_input(is_train, hparams):
     tgt_dataset = tf.data.TextLineDataset(hparams.tgt_dev_file)
   dataset = tf.data.Dataset.zip((src_dataset, tgt_dataset))
   if is_train:
-    dataset = dataset.repeat(10)
-    dataset = dataset.shuffle(10 * output_buffer_size)
+    dataset = dataset.repeat(hparams.num_epochs)
+    dataset = dataset.shuffle(output_buffer_size, reshuffle_each_iteration=True)
 
   dataset = dataset.map(
     lambda src, tgt: (
@@ -178,26 +204,6 @@ def get_input(is_train, hparams):
     'target_output': tgt_out,
     'target_length': tgt_len
   })
-
-def create_parameters():
-  hparams = tf.contrib.training.HParams(
-    batch_size=40,
-    sos='<s>',
-    eos='</s>',
-    embed_size=32,
-    num_units=64,
-    beam_width=10,
-    max_tgt_len=20,
-    src_train_file=os.path.join(FLAGS.data_dir, 'train.src'),
-    tgt_train_file=os.path.join(FLAGS.data_dir, 'train.tgt'),
-    src_dev_file=os.path.join(FLAGS.data_dir, 'dev.src'),
-    tgt_dev_file=os.path.join(FLAGS.data_dir, 'dev.tgt'),
-    src_test_file=os.path.join(FLAGS.data_dir, 'test.src'),
-    tgt_test_file=os.path.join(FLAGS.data_dir, 'test.tgt'),
-    src_vocab_file=os.path.join(FLAGS.data_dir, 'vocab.src'),
-    tgt_vocab_file=os.path.join(FLAGS.data_dir, 'vocab.tgt'),
-    output_dir=FLAGS.output_dir)
-  return hparams
 
 def create_embeddings(src_vocab_size,
                       tgt_vocab_size,
@@ -276,7 +282,7 @@ def build_decoder(decoder_initial_state,
         decoder_initial_state)
 
       # Dynamic decoding
-      outputs, final_context_state, _ = tf.contrib.seq2seq.dynamic_decode(
+      outputs, _, _ = tf.contrib.seq2seq.dynamic_decode(
         my_decoder,
         output_time_major=True,
         swap_memory=True,
@@ -294,8 +300,7 @@ def build_decoder(decoder_initial_state,
 
       loss = tf.reduce_sum(
         crossent * target_weights) / tf.to_float(hparams.batch_size)
-
-      return loss
+      sample_id = tf.no_op()
 
     else: # tf.estimator.ModeKeys.PREDICT
       decoder_initial_state = tf.contrib.seq2seq.tile_batch(
@@ -315,16 +320,17 @@ def build_decoder(decoder_initial_state,
         output_layer=output_layer)
 
       # Dynamic decoding
-      outputs, final_context_state, _ = tf.contrib.seq2seq.dynamic_decode(
+      outputs, _, _ = tf.contrib.seq2seq.dynamic_decode(
         my_decoder,
         maximum_iterations=hparams.max_tgt_len,
         output_time_major=True,
         swap_memory=True,
         scope=decoder_scope)
 
+      loss = tf.no_op()
       sample_id = outputs.predicted_ids
 
-    return sample_id
+    return loss, sample_id
 
 def model_fn(features, labels, mode, params):
   hparams = params['hparams']
@@ -348,52 +354,69 @@ def model_fn(features, labels, mode, params):
   with tf.variable_scope("dynamic_seq2seq"):
     encoder_state = build_encoder(
       src, src_len, embedding_encoder, hparams)
-    loss = build_decoder(
+    loss, sample_id = build_decoder(
       encoder_state, tgt_in, tgt_out, tgt_len, 
       embedding_decoder, tgt_vocab_size, mode, hparams)
 
   if mode == tf.estimator.ModeKeys.PREDICT:
-    sample_id = loss
     sample_id = tf.transpose(sample_id)
     predictions = {
-      'sample_id': sample_id,
+      'sample_id': sample_id
     }
     return tf.estimator.EstimatorSpec(mode, predictions=predictions)
 
+  predict_count = tf.reduce_sum(tgt_len)
+  ppl = tf.exp(loss * tf.to_float(hparams.batch_size) / tf.to_float(predict_count))
+
+  if mode == tf.estimator.ModeKeys.EVAL:
+    metrics = {
+    }
+    return tf.estimator.EstimatorSpec(mode, loss=loss, eval_metric_ops=metrics)
+
   assert mode == tf.estimator.ModeKeys.TRAIN
 
-  optimizer = tf.train.GradientDescentOptimizer(learning_rate=0.1)
-
+  optimizer = tf.train.GradientDescentOptimizer(learning_rate=hparams.learning_rate)
   train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
+  tf.summary.scalar('train_ppl', ppl)
 
   for v in tf.global_variables():
     print(v.name, v.shape)
 
   return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_op)
 
+def train(hparams):
+    estimator = tf.estimator.Estimator(
+      model_fn=model_fn,
+      params={'hparams': hparams}, 
+      model_dir=hparams.output_dir)
+    estimator.train(
+      input_fn=lambda: get_input(is_train=True, hparams=hparams))
+
+def eval(hparams):
+  pass
+
 def infer(hparams):
   tgt_idx2sym, _ = check_vocab(hparams.tgt_vocab_file)
-  estimator = tf.estimator.Estimator(model_fn=model_fn, params={'hparams': hparams}, model_dir=hparams.output_dir)
-  predictions = estimator.predict(input_fn=lambda: get_input(is_train=False, hparams=hparams))
+  estimator = tf.estimator.Estimator(
+    model_fn=model_fn,
+    params={'hparams': hparams},
+    model_dir=hparams.output_dir)
+  predictions = estimator.predict(
+    input_fn=lambda: get_input(is_train=False, hparams=hparams))
 
-  for p in predictions:
-    sample_id = p['sample_id']
-    print(sample_id)
-    for q in sample_id:
-      print(' '.join(tgt_idx2sym[y] for y in q))
-    break
+  tgt_eos_id = 2
+  for batch_prediction in predictions:
+    for sample in batch_prediction['sample_id']:
+      print(' '.join(tgt_idx2sym[tok] for tok in sample if tok != tgt_eos_id))
 
 def main(unused):
   hparams = create_parameters()
   if FLAGS.mode == 'datagen':
     datagen(hparams)
   elif FLAGS.mode == 'train':
-    estimator = tf.estimator.Estimator(
-      model_fn=model_fn,
-      params={
-        'hparams': hparams
-      }, model_dir=hparams.output_dir)
-    estimator.train(input_fn=lambda: get_input(is_train=True, hparams=hparams))
+    train(hparams)
+  elif FLAGS.mode == 'eval':
+    eval(hparams)
   elif FLAGS.mode == 'infer':
     infer(hparams)
   else:
