@@ -408,6 +408,7 @@ def infer(hparams):
   for batch_prediction in predictions:
     for sample in batch_prediction['sample_id']:
       print(' '.join(tgt_idx2sym[tok] for tok in sample if tok != tgt_eos_id))
+    break
 
 def main(unused):
   hparams = create_parameters()
